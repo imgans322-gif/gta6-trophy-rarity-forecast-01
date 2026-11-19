@@ -66,22 +66,42 @@ def inv_logit(x):
     return 100.0 * e / (1.0 + e)
 
 
-def linfit(xs, ys):
-    """Least-squares y = a + b*x. Returns (a, b, residual_sd)."""
+def linfit(xs, ys, ws=None):
+    """Weighted least-squares y = a + b*x. Returns (a, b, residual_sd).
+
+    Weights default to 1. Callers pass recency weights so the launch-day
+    chaos of the first snapshots does not dominate the slope: what the
+    series did lately says more about where it goes next.
+    """
     n = len(xs)
     if n == 0:
         return 0.0, 0.0, 0.0
-    mx = sum(xs) / n
-    my = sum(ys) / n
-    sxx = sum((x - mx) ** 2 for x in xs)
+    if ws is None:
+        ws = [1.0] * n
+    wsum = sum(ws)
+    mx = sum(w * x for x, w in zip(xs, ws)) / wsum
+    my = sum(w * y for y, w in zip(ys, ws)) / wsum
+    sxx = sum(w * (x - mx) ** 2 for x, w in zip(xs, ws))
     if sxx <= 0.0 or n < 2:
         return my, 0.0, 0.0
-    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    sxy = sum(w * (x - mx) * (y - my) for x, y, w in zip(xs, ys, ws))
     b = sxy / sxx
     a = my - b * mx
     resid = [y - (a + b * x) for x, y in zip(xs, ys)]
-    sd = math.sqrt(sum(r * r for r in resid) / n)
+    sd = math.sqrt(sum(w * r * r for r, w in zip(resid, ws)) / wsum)
     return a, b, sd
+
+
+def recency_weights(hours):
+    """Weights rising linearly from 0.45 at the first snapshot to 1.0 at
+    the last, so recent movement counts about twice as much as the
+    oldest movement in every fit."""
+    if not hours:
+        return []
+    span = max(hours[-1] - hours[0], 0.0)
+    if span <= 0.0:
+        return [1.0] * len(hours)
+    return [0.45 + 0.55 * (h - hours[0]) / span for h in hours]
 
 
 def snapshots(case):
@@ -139,7 +159,7 @@ def forecast_case(case):
     t0 = ts[0]
     hours = [(t - t0) / 3600.0 for t in ts]
     log_n = [math.log(s[1]) for s in snaps]
-    _, slope_n, _ = linfit(hours, log_n)
+    _, slope_n, _ = linfit(hours, log_n, recency_weights(hours))
     span_h = max(hours[-1], 0.0)
     damp_n = 0.55
     log_n_target = log_n[-1] + slope_n * horizon_h * damp_n
@@ -169,7 +189,7 @@ def forecast_case(case):
             # Earners/players extrapolation.
             xs = [p[0] for p in pts]
             ys = [math.log(p[2] + 0.5) for p in pts]
-            _, slope_e, _ = linfit(xs, ys)
+            _, slope_e, _ = linfit(xs, ys, recency_weights(xs))
             damp_e = 0.6
             log_e_target = ys[-1] + slope_e * horizon_h * damp_e
             log_e_target = min(log_e_target,
@@ -181,7 +201,8 @@ def forecast_case(case):
             # Logit trend against ln(1 + hours since release).
             xs2 = [math.log1p(p[1]) for p in pts]
             ys2 = [logit(p[3]) for p in pts]
-            a2, b2, _ = linfit(xs2, ys2)
+            a2, b2, _ = linfit(xs2, ys2,
+                              recency_weights([p[0] for p in pts]))
             tgt_rel = max((target_t - release_t) / 3600.0, 0.0)
             rate_tr = inv_logit(a2 + b2 * math.log1p(tgt_rel))
             medians.append(logit(rate_tr))
